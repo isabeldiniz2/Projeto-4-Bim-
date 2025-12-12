@@ -1,21 +1,25 @@
 const express = require("express");
 const path = require("path");
 const session = require("express-session");
-const sqlite3 = require("sqlite3").verbose();
+const { PrismaClient } = require("@prisma/client");
+
+const prisma = new PrismaClient(); 
 
 const app = express();
-const db = new sqlite3.Database(path.join(__dirname, "database", "biblioteca.db"));
 
 app.set("view engine", "ejs");
 app.set("views", path.join(__dirname, "views"));
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-app.use(session({
-  secret: "biblioteca-secreta",
-  resave: false,
-  saveUninitialized: false
-}));
+app.use(
+  session({
+    secret: "biblioteca-secreta",
+    resave: false,
+    saveUninitialized: false,
+  })
+);
 
 function auth(req, res, next) {
   if (!req.session.user) return res.redirect("/");
@@ -28,7 +32,7 @@ app.get("/", (req, res) => {
   res.render("login", { erro });
 });
 
-app.post("/login", (req, res) => {
+app.post("/login", async (req, res) => {
   const { usuario, senha } = req.body;
 
   if (usuario === "administrador@gmail.com" && senha === "1") {
@@ -36,25 +40,22 @@ app.post("/login", (req, res) => {
       id: 0,
       nome: "Super Administrador",
       email: usuario,
-      tipo: "admin"
+      tipo: "admin",
     };
     return res.redirect("/livros");
   }
 
-  db.get(
-    "SELECT * FROM usuarios WHERE email = ? AND senha = ?",
-    [usuario, senha],
-    (err, row) => {
-      if (!row) {
-        req.session.erro = "E-mail ou senha incorretos!";
-        return res.redirect("/");
-      }
+  const user = await prisma.usuarios.findFirst({
+    where: { email: usuario, senha },
+  });
 
-      row.tipo = "usuario";
-      req.session.user = row;
-      res.redirect("/inicio");
-    }
-  );
+  if (!user) {
+    req.session.erro = "E-mail ou senha incorretos!";
+    return res.redirect("/");
+  }
+
+  req.session.user = { ...user, tipo: "usuario" };
+  res.redirect("/inicio");
 });
 
 app.get("/cadastro", (req, res) => {
@@ -63,281 +64,268 @@ app.get("/cadastro", (req, res) => {
   res.render("cadastro", { erro });
 });
 
-app.post("/cadastro", (req, res) => {
+app.post("/cadastro", async (req, res) => {
   const { nome, email, senha } = req.body;
 
-  db.run(
-    "INSERT INTO usuarios (nome, email, senha) VALUES (?, ?, ?)",
-    [nome, email, senha],
-    err => {
-      if (err) {
-        req.session.erro = "Erro ao cadastrar.";
-        return res.redirect("/cadastro");
-      }
+  try {
+    await prisma.usuarios.create({
+      data: { nome, email, senha },
+    });
 
-      req.session.erro = "Usuário cadastrado!";
-      res.redirect("/");
-    }
-  );
+    req.session.erro = "Usuário cadastrado!";
+    res.redirect("/");
+  } catch (err) {
+    req.session.erro = "Erro ao cadastrar.";
+    res.redirect("/cadastro");
+  }
 });
 
 app.get("/logout", (req, res) => {
   req.session.destroy(() => res.redirect("/"));
 });
 
-app.get("/inicio", auth, (req, res) => {
-  db.all("SELECT * FROM livros ORDER BY id DESC LIMIT 8", (err, rows) => {
-    res.render("index", { usuario: req.session.user, ultimos: rows });
+app.get("/inicio", auth, async (req, res) => {
+  const ultimos = await prisma.livros.findMany({
+    orderBy: { id: "desc" },
+    take: 8,
+  });
+
+  res.render("index", { usuario: req.session.user, ultimos });
+});
+
+app.get("/buscar", auth, async (req, res) => {
+  const termo = req.query.q.trim();
+
+  const livros = await prisma.livros.findMany({
+    where: {
+      OR: [
+        { nome: { contains: termo } },
+        { autor: { contains: termo } },
+        { categoria: { contains: termo } },
+      ],
+    },
+  });
+
+  res.render("categoria", {
+    livros,
+    categoria: "Resultado da Busca",
   });
 });
 
-app.get("/buscar", auth, (req, res) => {
-  const termo = (req.query.q || "").trim();
-  if (!termo) return res.redirect("/inicio");
-
-  const q = "%" + termo + "%";
-
-  db.all(
-    "SELECT * FROM livros WHERE nome LIKE ? OR autor LIKE ? OR categoria LIKE ?",
-    [q, q, q],
-    (err, rows) => {
-      res.render("categoria", {
-        livros: rows,
-        categoria: "Resultado da Busca"
-      });
-    }
-  );
-});
-
-app.get("/livros", auth, (req, res) => {
+app.get("/livros", auth, async (req, res) => {
   if (req.session.user.tipo !== "admin") return res.send("Acesso negado.");
 
-  db.all("SELECT * FROM livros ORDER BY id DESC", (err, rows) => {
-    res.render("livros", { livros: rows });
+  const livros = await prisma.livros.findMany({
+    orderBy: { id: "desc" },
   });
+
+  res.render("livros", { livros });
 });
 
-app.post("/livros", auth, (req, res) => {
+app.post("/livros", auth, async (req, res) => {
   const { nome, autor, capa, categoria } = req.body;
 
-  db.run(
-    "INSERT INTO livros (nome, autor, capa, categoria) VALUES (?, ?, ?, ?)",
-    [nome, autor, capa, categoria],
-    () => res.redirect("/livros")
-  );
-});
-
-app.get("/livros/:id", auth, (req, res) => {
-  db.get("SELECT * FROM livros WHERE id = ?", [req.params.id], (err, row) => {
-    res.render("detalhe", { livro: row });
+  await prisma.livros.create({
+    data: { nome, autor, capa, categoria },
   });
+
+  res.redirect("/livros");
 });
 
-app.get("/livros/editar/:id", auth, (req, res) => {
+app.get("/livros/:id", auth, async (req, res) => {
+  const livro = await prisma.livros.findUnique({
+    where: { id: Number(req.params.id) },
+  });
+
+  res.render("detalhe", { livro });
+});
+
+app.get("/livros/editar/:id", auth, async (req, res) => {
   if (req.session.user.tipo !== "admin") return res.send("Acesso negado.");
 
-  db.get("SELECT * FROM livros WHERE id = ?", [req.params.id], (err, row) => {
-    if (!row) return res.send("Livro não encontrado.");
-    res.render("editar", { livro: row });
+  const livro = await prisma.livros.findUnique({
+    where: { id: Number(req.params.id) },
   });
+
+  res.render("editar", { livro });
 });
 
-app.post("/livros/editar/:id", auth, (req, res) => {
+app.post("/livros/editar/:id", auth, async (req, res) => {
   if (req.session.user.tipo !== "admin") return res.send("Acesso negado.");
 
   const { nome, autor, capa, categoria } = req.body;
 
-  db.run(
-    `UPDATE livros SET nome=?, autor=?, capa=?, categoria=? WHERE id=?`,
-    [nome, autor, capa, categoria, req.params.id],
-    () => res.redirect("/livros")
-  );
-});
-
-app.get("/livros/excluir/:id", auth, (req, res) => {
-  if (req.session.user.tipo !== "admin") return res.send("Acesso negado.");
-
-  db.run("DELETE FROM livros WHERE id = ?", [req.params.id], () => {
-    res.redirect("/livros");
+  await prisma.livros.update({
+    where: { id: Number(req.params.id) },
+    data: { nome, autor, capa, categoria },
   });
+
+  res.redirect("/livros");
 });
 
-app.get("/romance", auth, (req, res) => {
-  db.all("SELECT * FROM livros WHERE categoria = 'romance'", (err, rows) => {
-    res.render("categoria", { livros: rows, categoria: "Romance" });
+app.get("/livros/excluir/:id", auth, async (req, res) => {
+  await prisma.livros.delete({
+    where: { id: Number(req.params.id) },
   });
+
+  res.redirect("/livros");
 });
 
-app.get("/ficcao", auth, (req, res) => {
-  db.all("SELECT * FROM livros WHERE categoria = 'ficcao'", (err, rows) => {
-    res.render("categoria", { livros: rows, categoria: "Ficção Científica" });
+app.get("/romance", auth, async (req, res) => {
+  const livros = await prisma.livros.findMany({
+    where: { categoria: "romance" },
   });
+
+  res.render("categoria", { livros, categoria: "Romance" });
 });
 
-app.get("/infantil", auth, (req, res) => {
-  db.all("SELECT * FROM livros WHERE categoria = 'infantil'", (err, rows) => {
-    res.render("categoria", { livros: rows, categoria: "Infantil" });
+app.get("/ficcao", auth, async (req, res) => {
+  const livros = await prisma.livros.findMany({
+    where: { categoria: "ficcao" },
   });
+
+  res.render("categoria", { livros, categoria: "Ficção Científica" });
 });
 
-app.post("/alugar/:id", auth, (req, res) => {
-  const id = req.params.id;
+app.get("/infantil", auth, async (req, res) => {
+  const livros = await prisma.livros.findMany({
+    where: { categoria: "infantil" },
+  });
+
+  res.render("categoria", { livros, categoria: "Infantil" });
+});
+
+app.post("/alugar/:id", auth, async (req, res) => {
+  const id = Number(req.params.id);
   const dias = parseInt(req.body.dias);
 
-  if (!dias || dias <= 0) return res.send("Dias inválidos.");
+  const livro = await prisma.livros.findUnique({ where: { id } });
 
-  db.get("SELECT alugado FROM livros WHERE id = ?", [id], (err, row) => {
-    if (row.alugado === 1) {
-      return res.send("Este livro já está alugado por outro usuário.");
-    }
+  if (livro.alugado === 1) {
+    return res.send("Este livro já está alugado.");
+  }
 
-    const data = new Date();
-    data.setDate(data.getDate() + dias);
-    const devolucao = data.toLocaleDateString("pt-BR");
+  const data = new Date();
+  data.setDate(data.getDate() + dias);
+  const devolucao = data.toLocaleDateString("pt-BR");
 
-    db.run(
-      `UPDATE livros 
-       SET alugado = 1, usuarioAlugou = ?, dataDevolucao = ?
-       WHERE id = ? AND alugado = 0`,
-      [req.session.user.nome, devolucao, id],
-      function (err) {
-        if (err) return res.send("Erro ao alugar.");
-
-        if (this.changes === 0) {
-          return res.send("Este livro já está alugado.");
-        }
-
-        res.redirect("/livros/" + id);
-      }
-    );
+  await prisma.livros.update({
+    where: { id },
+    data: {
+      alugado: 1,
+      usuarioAlugou: req.session.user.nome,
+      dataDevolucao: devolucao,
+    },
   });
+
+  res.redirect("/livros/" + id);
 });
 
-app.post("/devolver/:id", auth, (req, res) => {
-  const id = req.params.id;
+app.post("/devolver/:id", auth, async (req, res) => {
+  await prisma.livros.update({
+    where: { id: Number(req.params.id) },
+    data: {
+      alugado: 0,
+      usuarioAlugou: null,
+      dataDevolucao: null,
+    },
+  });
 
-  db.run(
-    `UPDATE livros 
-     SET alugado = 0, usuarioAlugou = null, dataDevolucao = null
-     WHERE id = ?`,
-    [id],
-    () => res.redirect("/alugados")
-  );
+  res.redirect("/alugados");
 });
 
-app.get("/alugados", auth, (req, res) => {
-  db.all(
-    "SELECT * FROM livros WHERE alugado = 1 AND usuarioAlugou = ?",
-    [req.session.user.nome],
-    (err, rows) => {
-      res.render("alugados", { livros: rows });
-    }
-  );
+app.get("/alugados", auth, async (req, res) => {
+  const livros = await prisma.livros.findMany({
+    where: { alugado: 1, usuarioAlugou: req.session.user.nome },
+  });
+
+  res.render("alugados", { livros });
 });
 
-app.get("/admin/usuarios", auth, (req, res) => {
+app.get("/admin/usuarios", auth, async (req, res) => {
   if (req.session.user.tipo !== "admin") return res.send("Acesso negado.");
 
-  const sql = `
-    SELECT u.id AS usuarioId, u.nome AS usuarioNome, u.email,
-           l.nome AS livroNome, l.autor, l.dataDevolucao
-    FROM usuarios u
-    LEFT JOIN livros l ON l.usuarioAlugou = u.nome
-    ORDER BY u.id ASC
-  `;
-
-  db.all(sql, [], (err, rows) => {
-    res.render("usuariosAdmin", { dados: rows });
+  const dados = await prisma.usuarios.findMany({
+    include: {
+      livros_usuarioAlugouTolivros: true,
+    },
   });
+
+  res.render("usuariosAdmin", { dados });
 });
 
+//  API 
 
-// API
-
-app.get("/api/livros", (req, res) => {
-  db.all("SELECT * FROM livros", [], (err, rows) => {
-    if (err) return res.json({ erro: "Erro ao listar livros" });
-    res.json(rows);
-  });
+app.get("/api/livros", async (req, res) => {
+  const livros = await prisma.livros.findMany();
+  res.json(livros);
 });
 
-app.get("/api/livros/:id", (req, res) => {
-  db.get("SELECT * FROM livros WHERE id = ?", [req.params.id], (err, row) => {
-    if (err) return res.json({ erro: "Erro ao buscar livro" });
-    if (!row) return res.json({ erro: "Livro não encontrado" });
-    res.json(row);
+app.get("/api/livros/:id", async (req, res) => {
+  const livro = await prisma.livros.findUnique({
+    where: { id: Number(req.params.id) },
   });
+
+  if (!livro) return res.json({ erro: "Livro não encontrado" });
+  res.json(livro);
 });
 
-app.post("/api/login", (req, res) => {
+app.post("/api/login", async (req, res) => {
   const { email, senha } = req.body;
 
-  db.get(
-    "SELECT * FROM usuarios WHERE email = ? AND senha = ?",
-    [email, senha],
-    (err, row) => {
-      if (err) return res.json({ erro: "Erro ao fazer login" });
+  const user = await prisma.usuarios.findFirst({
+    where: { email, senha },
+  });
 
-      if (!row) {
-        return res.json({ erro: "Credenciais inválidas" });
-      }
+  if (!user) return res.json({ erro: "Credenciais inválidas" });
 
-      res.json({
-        mensagem: "Login bem-sucedido",
-        usuario: {
-          id: row.id,
-          nome: row.nome,
-          email: row.email
-        }
-      });
-    }
-  );
-});
-
-app.post("/api/alugar/:id", (req, res) => {
-  const { usuario, dias } = req.body;
-  const id = req.params.id;
-
-  if (!dias || dias <= 0)
-    return res.json({ erro: "Dias inválidos" });
-
-  db.get("SELECT alugado FROM livros WHERE id = ?", [id], (err, row) => {
-    if (row.alugado === 1) {
-      return res.json({ erro: "Livro já está alugado" });
-    }
-
-    const data = new Date();
-    data.setDate(data.getDate() + parseInt(dias));
-    const dataDev = data.toLocaleDateString("pt-BR");
-
-    db.run(
-      `UPDATE livros SET alugado = 1, usuarioAlugou = ?, dataDevolucao = ? WHERE id = ?`,
-      [usuario, dataDev, id],
-      function (err) {
-        if (err) return res.json({ erro: "Erro ao alugar" });
-
-        res.json({
-          mensagem: "Livro alugado com sucesso!",
-          devolucao: dataDev
-        });
-      }
-    );
+  res.json({
+    mensagem: "Login bem-sucedido",
+    usuario: user,
   });
 });
 
-app.post("/api/devolver/:id", (req, res) => {
-  const id = req.params.id;
+app.post("/api/alugar/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  const { usuario, dias } = req.body;
 
-  db.run(
-    `UPDATE livros SET alugado = 0, usuarioAlugou = null, dataDevolucao = null WHERE id = ?`,
-    [id],
-    function (err) {
-      if (err) return res.json({ erro: "Erro ao devolver" });
+  const livro = await prisma.livros.findUnique({ where: { id } });
 
-      res.json({ mensagem: "Livro devolvido com sucesso!" });
-    }
-  );
+  if (!livro || livro.alugado === 1)
+    return res.json({ erro: "Livro já alugado" });
+
+  const data = new Date();
+  data.setDate(data.getDate() + parseInt(dias));
+  const devolucao = data.toLocaleDateString("pt-BR");
+
+  await prisma.livros.update({
+    where: { id },
+    data: {
+      alugado: 1,
+      usuarioAlugou: usuario,
+      dataDevolucao: devolucao,
+    },
+  });
+
+  res.json({
+    mensagem: "Livro alugado com sucesso!",
+    devolucao,
+  });
 });
 
+app.post("/api/devolver/:id", async (req, res) => {
+  await prisma.livros.update({
+    where: { id: Number(req.params.id) },
+    data: {
+      alugado: 0,
+      usuarioAlugou: null,
+      dataDevolucao: null,
+    },
+  });
 
-app.listen(3000, () => console.log("Servidor rodando na porta 3000"));
+  res.json({ mensagem: "Livro devolvido com sucesso!" });
+});
+
+app.listen(3000, () =>
+  console.log("Servidor rodando com Prisma na porta 3000")
+);

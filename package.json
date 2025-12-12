@@ -10,9 +10,13 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@prisma/client": "^7.1.0",
     "ejs": "^3.1.10",
     "express": "^5.2.1",
     "express-session": "^1.18.2",
     "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "prisma": "^7.1.0"
   }
 }
